@@ -9,6 +9,7 @@ import {
   bulkImport,
   bulkExport,
   getMetadata,
+  getFilters,
   getCategories,
   createCategory,
   updateCategory,
@@ -20,7 +21,8 @@ import {
   getScreenTypes,
   createScreenType,
   updateScreenType,
-  deleteScreenType
+  deleteScreenType,
+  backfillPriceGbp
 } from '../controllers/productController.js';
 import upload from '../middlewares/upload.js';
 
@@ -29,6 +31,9 @@ const router = Router();
 // Products search, lisgetProductst, create
 router.get('/', getProducts);
 router.post('/', createProduct);
+
+// Dynamic filters
+router.get('/filters', getFilters);
 
 // Dynamic categories & subcategories metadata
 router.get('/metadata', getMetadata);
@@ -57,6 +62,9 @@ router.get('/export', bulkExport);
 
 // Multiple image upload endpoint
 router.post('/upload-images', upload.array('images', 10), uploadImages);
+
+// Backfill priceGbp for existing products imported with only landedCostGbp
+router.post('/backfill-prices', backfillPriceGbp);
 
 // Get, update, delete single product
 router.get('/:idOrSlug', getProductById);

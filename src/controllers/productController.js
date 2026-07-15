@@ -3,6 +3,7 @@ import { generateUniqueSlug } from '../utils/slug.js';
 import xlsx from 'xlsx';
 import fs from 'fs';
 import path from 'path';
+import { filterableFields } from '../config/filtersConfig.js';
 
 /**
  * Helper to clean up files
@@ -75,57 +76,171 @@ export const getProducts = async (req, res, next) => {
     const page = parseInt(req.query.page, 10) || 1;
     const limit = parseInt(req.query.limit, 10) || 12;
     const search = req.query.search || '';
-    const productFamily = req.query.productFamily || '';
-    const use = req.query.use || '';
-    const indoorOutdoor = req.query.indoorOutdoor || '';
-    const screenType = req.query.screenType || '';
+    const sort = req.query.sort || 'recommended';
 
     const skip = (page - 1) * limit;
 
     // Define where conditions
     const where = {};
 
-    // Filter by family
-    if (productFamily) {
-      where.productFamily = productFamily;
+    // Helper to add multi-select "in" condition
+    const addMultiSelectFilter = (queryParam, dbField) => {
+      const val = req.query[queryParam];
+      if (val) {
+        const items = val.split(',').map(v => v.trim()).filter(Boolean);
+        if (items.length > 0) {
+          where[dbField] = { in: items };
+        }
+      }
+    };
+
+    // Add all filters
+    addMultiSelectFilter('category', 'productFamily'); // maps category to productFamily
+    addMultiSelectFilter('productFamily', 'productFamily'); // support direct parameter
+    addMultiSelectFilter('use', 'use');
+    addMultiSelectFilter('screenType', 'screenType');
+    addMultiSelectFilter('size', 'size');
+    addMultiSelectFilter('brightness', 'brightness');
+    addMultiSelectFilter('pixelPitch', 'pixelPitch');
+    addMultiSelectFilter('indoorOutdoor', 'indoorOutdoor');
+    addMultiSelectFilter('mount', 'mount');
+    addMultiSelectFilter('operatingSystem', 'operatingSystem');
+    addMultiSelectFilter('brand', 'ocBrand');
+    addMultiSelectFilter('manufacturer', 'supplier');
+
+    // Filter by price range (GBP)
+    // Strategy: COALESCE across onlinePrice, priceGbp, and CAST(landedCostGbp AS DECIMAL)
+    // We use $queryRaw to get matching IDs via MySQL CASE expression, then filter by those IDs.
+    const minPrice = parseFloat(req.query.minPrice);
+    const maxPrice = parseFloat(req.query.maxPrice);
+
+    if (!isNaN(minPrice) || !isNaN(maxPrice)) {
+      // Use raw SQL to COALESCE across all three price columns including the string landedCostGbp.
+      // MySQL: CAST(REGEXP_REPLACE(landed_cost_gbp, '[^0-9.]', '') AS DECIMAL(10,2))
+      // Effective price = COALESCE(online_price, price_gbp, parsed_landed_cost_gbp)
+      let rawSql, rawParams;
+      if (!isNaN(minPrice) && !isNaN(maxPrice)) {
+        rawSql = `
+          SELECT id FROM products
+          WHERE COALESCE(
+            online_price,
+            price_gbp,
+            CAST(REGEXP_REPLACE(COALESCE(landed_cost_gbp, ''), '[^0-9.]', '') AS DECIMAL(10,2))
+          ) BETWEEN ? AND ?
+        `;
+        rawParams = [minPrice, maxPrice];
+      } else if (!isNaN(minPrice)) {
+        rawSql = `
+          SELECT id FROM products
+          WHERE COALESCE(
+            online_price,
+            price_gbp,
+            CAST(REGEXP_REPLACE(COALESCE(landed_cost_gbp, ''), '[^0-9.]', '') AS DECIMAL(10,2))
+          ) >= ?
+        `;
+        rawParams = [minPrice];
+      } else {
+        rawSql = `
+          SELECT id FROM products
+          WHERE COALESCE(
+            online_price,
+            price_gbp,
+            CAST(REGEXP_REPLACE(COALESCE(landed_cost_gbp, ''), '[^0-9.]', '') AS DECIMAL(10,2))
+          ) <= ?
+        `;
+        rawParams = [maxPrice];
+      }
+      const matchingRows = await prisma.$queryRawUnsafe(rawSql, ...rawParams);
+      const matchingIds = matchingRows.map(r => r.id);
+      where.id = { in: matchingIds.length > 0 ? matchingIds : [-1] };
     }
 
-    // Filter by use
-    if (use) {
-      where.use = use;
-    }
 
-    // Filter by indoor/outdoor
-    if (indoorOutdoor) {
-      where.indoorOutdoor = indoorOutdoor;
-    }
-
-    // Filter by screen type
-    if (screenType) {
-      where.screenType = screenType;
-    }
-
-    // Search query (matches multiple text fields)
     if (search) {
-      where.OR = [
-        { model: { contains: search } },
-        { productName: { contains: search } },
-        { productFamily: { contains: search } },
-        { use: { contains: search } },
-        { productSummary: { contains: search } },
-        { longDescription: { contains: search } }
+      const searchCond = { contains: search };
+      const searchFields = [
+        { model: searchCond },
+        { productName: searchCond },
+        { productFamily: searchCond },
+        { use: searchCond },
+        { productSummary: searchCond },
+        { longDescription: searchCond }
       ];
+
+      if (where.OR) {
+        // If OR is already used (e.g. for price range), we AND the search condition with it
+        where.AND = [
+          { OR: where.OR },
+          { OR: searchFields }
+        ];
+        delete where.OR;
+      } else {
+        where.OR = searchFields;
+      }
     }
 
-    const [products, total] = await Promise.all([
-      prisma.product.findMany({
-        where,
-        skip,
-        take: limit,
-        orderBy: { createdAt: 'desc' }
-      }),
-      prisma.product.count({ where })
-    ]);
+    // ── In-memory sort + paginate ─────────────────────────────────────────────
+    // Prisma cannot ORDER BY a COALESCE across onlinePrice / priceGbp / landedCostGbp.
+    // For the current dataset size (hundreds of products) fetching all matching rows,
+    // sorting in Node.js, then slicing is fast and 100% correct.
+    // For name-asc and recommended we can still use DB ordering via Prisma, which
+    // is fine since they don't rely on computed values.
+
+    let allFiltered;
+    const total = await prisma.product.count({ where });
+
+    if (sort === 'price-low' || sort === 'price-high') {
+      // Fetch all matching rows for in-memory price sort
+      allFiltered = await prisma.product.findMany({ where });
+
+      // Parse landedCostGbp safely
+      const parseLandedCost = (val) => {
+        if (!val) return 0;
+        const cleaned = String(val).replace(/[^0-9.]/g, '');
+        const num = parseFloat(cleaned);
+        return isNaN(num) ? 0 : num;
+      };
+
+      // Effective price = onlinePrice (for online products) OR priceGbp (for quote products)
+      const effectivePrice = (p) => {
+        const parsedLanded = parseLandedCost(p.landedCostGbp);
+        if (p.purchaseType === 'online') {
+          return p.onlinePrice ?? p.priceGbp ?? parsedLanded ?? 0;
+        }
+        return p.priceGbp ?? p.onlinePrice ?? parsedLanded ?? 0;
+      };
+
+      if (sort === 'price-low') {
+        allFiltered.sort((a, b) => effectivePrice(a) - effectivePrice(b));
+      } else {
+        allFiltered.sort((a, b) => effectivePrice(b) - effectivePrice(a));
+      }
+
+      // Slice for current page
+      const products = allFiltered.slice(skip, skip + limit);
+
+      return res.status(200).json({
+        success: true,
+        data: products,
+        pagination: {
+          total,
+          page,
+          limit,
+          totalPages: Math.ceil(total / limit)
+        }
+      });
+    }
+
+    // Default: name-asc or recommended — use DB ordering via Prisma
+    let orderBy = { createdAt: 'desc' };
+    if (sort === 'name-asc') orderBy = { productName: 'asc' };
+
+    const products = await prisma.product.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy,
+    });
 
     res.status(200).json({
       success: true,
@@ -141,6 +256,85 @@ export const getProducts = async (req, res, next) => {
     next(error);
   }
 };
+
+/**
+ * Get distinct filterable values for properties
+ * Also returns meta.categorySubcategoryMap for hierarchical filter UX
+ */
+export const getFilters = async (req, res, next) => {
+  try {
+    const filters = {};
+
+    // --- Categories from Category table (with their linked subcategories) ---
+    const categoriesWithSubs = await prisma.category.findMany({
+      where: { status: 'Active' },
+      orderBy: { name: 'asc' },
+      include: {
+        subcategories: {
+          where: { status: 'Active' },
+          select: { name: true },
+          orderBy: { name: 'asc' }
+        }
+      }
+    });
+    filters.productFamily = categoriesWithSubs.map(c => c.name.trim()).filter(Boolean);
+
+    // Build category → subcategory mapping for hierarchical filter UX
+    const categorySubcategoryMap = {};
+    for (const cat of categoriesWithSubs) {
+      categorySubcategoryMap[cat.name.trim()] = cat.subcategories
+        .map(s => s.name.trim())
+        .filter(Boolean);
+    }
+
+    // --- All Subcategories (Use Cases) from Subcategory table ---
+    const subcategories = await prisma.subcategory.findMany({
+      where: { status: 'Active' },
+      select: { name: true },
+      orderBy: { name: 'asc' }
+    });
+    filters.use = [...new Set(subcategories.map(s => s.name.trim()).filter(Boolean))];
+
+    // --- Screen Types from ScreenType table ---
+    const screenTypes = await prisma.screenType.findMany({
+      where: { status: 'Active' },
+      select: { name: true },
+      orderBy: { name: 'asc' }
+    });
+    filters.screenType = screenTypes.map(st => st.name.trim()).filter(Boolean);
+
+    // --- Remaining fields from Product distinct values ---
+    const remainingFields = [
+      { field: 'size' },
+      { field: 'brightness' },
+      { field: 'pixelPitch' },
+      { field: 'indoorOutdoor' },
+      { field: 'mount' },
+      { field: 'operatingSystem' }
+    ];
+
+    for (const item of remainingFields) {
+      const distinctValues = await prisma.product.findMany({
+        select: { [item.field]: true },
+        distinct: [item.field],
+        where: { [item.field]: { not: null } }
+      });
+      const values = distinctValues
+        .map(v => v[item.field]?.trim())
+        .filter(Boolean);
+      filters[item.field] = [...new Set(values)].sort();
+    }
+
+    res.status(200).json({
+      success: true,
+      data: filters,
+      meta: { categorySubcategoryMap }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 
 /**
  * Get single product by ID or Slug
@@ -180,8 +374,52 @@ export const getProductById = async (req, res, next) => {
 };
 
 /**
- * Create a new product manually
+ * Helper to parse a GBP string like "£363" or "363.50" into a Float
  */
+const parsePriceGbp = (val) => {
+  if (val === null || val === undefined || val === '') return null;
+  const num = parseFloat(String(val).replace(/[^0-9.]/g, ''));
+  return isNaN(num) ? null : num;
+};
+
+/**
+ * Backfill priceGbp for all products that have landedCostGbp but missing priceGbp.
+ * Call POST /products/backfill-prices once to fix existing data.
+ */
+export const backfillPriceGbp = async (req, res, next) => {
+  try {
+    const products = await prisma.product.findMany({
+      where: {
+        priceGbp: null,
+        landedCostGbp: { not: null }
+      },
+      select: { id: true, landedCostGbp: true }
+    });
+
+    let updated = 0;
+    for (const p of products) {
+      const parsed = parsePriceGbp(p.landedCostGbp);
+      if (parsed !== null) {
+        await prisma.product.update({
+          where: { id: p.id },
+          data: { priceGbp: parsed }
+        });
+        updated++;
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      message: `Backfilled priceGbp for ${updated} products (out of ${products.length} checked).`,
+      updated
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+
+
 export const createProduct = async (req, res, next) => {
   try {
     const productData = req.body;
@@ -198,6 +436,11 @@ export const createProduct = async (req, res, next) => {
 
     // Resolve category, subcategory, screenType relations
     const resolvedData = await resolveProductRelations(productData);
+
+    // Auto-populate priceGbp from landedCostGbp if not explicitly set
+    if (!resolvedData.priceGbp && resolvedData.landedCostGbp) {
+      resolvedData.priceGbp = parsePriceGbp(resolvedData.landedCostGbp);
+    }
 
     const product = await prisma.product.create({
       data: {
@@ -252,6 +495,11 @@ export const updateProduct = async (req, res, next) => {
 
     // Resolve category, subcategory, screenType relations
     const resolvedData = await resolveProductRelations(updateData);
+
+    // Auto-populate priceGbp from landedCostGbp if not explicitly set
+    if (!resolvedData.priceGbp && resolvedData.landedCostGbp) {
+      resolvedData.priceGbp = parsePriceGbp(resolvedData.landedCostGbp);
+    }
 
     const updated = await prisma.product.update({
       where: { id: parseInt(id, 10) },
@@ -487,6 +735,9 @@ export const bulkImport = async (req, res, next) => {
         }
       }
 
+      // Auto-populate priceGbp from landedCostGbp for numeric filtering
+      const parsedPriceGbp = parsePriceGbp(landedCostGbp);
+
       productsToCreate.push({
         dateAdded,
         productFamily,
@@ -527,6 +778,7 @@ export const bulkImport = async (req, res, next) => {
         shipping,
         landedCostUsd,
         landedCostGbp,
+        priceGbp: parsedPriceGbp,  // numeric copy for price range filtering
         quotes,
         categoryId,
         subcategoryId,
